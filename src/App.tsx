@@ -1,10 +1,18 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
+type RuleKind = "budget" | "leverage" | "provider_condition" | "blocked_term";
+
 type MemoryRule = {
   name: string;
+  status: "active" | "revoked";
   label: string;
   detail: string;
   source: string;
+  kind: RuleKind;
+  max_budget?: number;
+  max_leverage?: number;
+  provider?: string;
+  blocked_term?: string;
   updated_at?: string;
 };
 
@@ -13,12 +21,17 @@ type AuditEvent = {
   ts: string;
   decision: string;
   summary: string;
+  request: string;
+  matches: string[];
+  allowed_budget: number;
+  session_id: string;
 };
 
 type AppState = {
-  seeded: boolean;
   provider: string;
   rules: MemoryRule[];
+  active_count: number;
+  revoked_count: number;
   events: AuditEvent[];
 };
 
@@ -30,208 +43,248 @@ type Decision = {
   counterfactual: string;
   matches: MemoryRule[];
   requested_budget: number;
+  requested_leverage: number;
   allowed_budget: number;
 };
 
-const DEMO_REQUEST = "Hire Atlas Grid with a $5,000 budget and allow up to 5x leverage.";
+type RuleDraft = { kind: RuleKind; label: string; detail: string; value: string };
 
-const fallbackRules: MemoryRule[] = [
-  { name: "leverage_ceiling", label: "Leverage ceiling", detail: "Never approve more than 2× leverage.", source: "Signed mandate · 18 Aug" },
-  { name: "job_budget", label: "First-job cap", detail: "New providers may receive at most $2,000.", source: "Budget revision · 20 Aug" },
-  { name: "atlas_incident", label: "Atlas Grid incident", detail: "Require a dry run before Atlas Grid can touch funds.", source: "Failed delivery · 22 Aug" },
+const EXAMPLES = [
+  { label: "Blocked", text: "Hire Atlas Grid with a $5,000 budget and allow up to 5x leverage." },
+  { label: "Bound", text: "Pay a new research provider $6,500 with no leverage." },
+  { label: "Cleared", text: "Pay a new research provider $1,200 with no leverage." },
 ];
+
+const EMPTY_STATE: AppState = { provider: "Sibyl Memory", rules: [], active_count: 0, revoked_count: 0, events: [] };
+const EMPTY_RULE: RuleDraft = { kind: "budget", label: "", detail: "", value: "" };
+
+const KIND_META: Record<RuleKind, { label: string; valueLabel: string; placeholder: string }> = {
+  budget: { label: "Spending cap", valueLabel: "Maximum USD", placeholder: "2000" },
+  leverage: { label: "Leverage cap", valueLabel: "Maximum leverage", placeholder: "2" },
+  provider_condition: { label: "Blocked provider", valueLabel: "Provider name", placeholder: "Atlas Grid" },
+  blocked_term: { label: "Blocked phrase", valueLabel: "Phrase to stop", placeholder: "seed phrase" },
+};
 
 async function callApi<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
     ...init,
   });
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) {
+    const raw = await response.text();
+    try {
+      const parsed = JSON.parse(raw) as { detail?: string | { msg?: string }[] };
+      if (typeof parsed.detail === "string") throw new Error(parsed.detail);
+      if (Array.isArray(parsed.detail)) throw new Error(parsed.detail[0]?.msg ?? "The request could not be completed.");
+    } catch (error) {
+      if (error instanceof Error && error.message !== "Unexpected end of JSON input") throw error;
+    }
+    throw new Error("The request could not be completed.");
+  }
   return response.json() as Promise<T>;
 }
 
-export default function App() {
-  const [state, setState] = useState<AppState>({ seeded: false, provider: "Sibyl Memory", rules: [], events: [] });
-  const [request, setRequest] = useState(DEMO_REQUEST);
-  const [decision, setDecision] = useState<Decision | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [offline, setOffline] = useState(false);
-  const [session, setSession] = useState(1);
+function ruleControl(rule: MemoryRule) {
+  if (rule.kind === "budget") return `$${rule.max_budget?.toLocaleString()} max`;
+  if (rule.kind === "leverage") return `${rule.max_leverage}× max`;
+  if (rule.kind === "provider_condition") return rule.provider;
+  return `“${rule.blocked_term}”`;
+}
 
-  const visibleRules = state.rules.length ? state.rules : fallbackRules;
-  const boundCount = state.seeded ? state.rules.length : 0;
+export default function App() {
+  const [state, setState] = useState<AppState>(EMPTY_STATE);
+  const [request, setRequest] = useState(EXAMPLES[0].text);
+  const [decision, setDecision] = useState<Decision | null>(null);
+  const [draft, setDraft] = useState<RuleDraft>(EMPTY_RULE);
+  const [showComposer, setShowComposer] = useState(false);
+  const [showRevoked, setShowRevoked] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [offline, setOffline] = useState(false);
+  const [message, setMessage] = useState("");
+
+  const activeRules = state.rules.filter((rule) => rule.status === "active");
+  const revokedRules = state.rules.filter((rule) => rule.status === "revoked");
+  const matchedNames = useMemo(() => new Set(decision?.matches.map((rule) => rule.name) ?? []), [decision]);
+  const requestSignals = useMemo(() => {
+    const budget = request.match(/\$\s*([\d,]+)/)?.[1];
+    const leverage = request.match(/(\d+(?:\.\d+)?)\s*[x×]/i)?.[1];
+    return { budget: budget ? `$${Number(budget.replaceAll(",", "")).toLocaleString()}` : "not stated", leverage: leverage ? `${leverage}×` : "1× default" };
+  }, [request]);
 
   useEffect(() => {
     callApi<AppState>("/api/state")
-      .then((payload) => {
-        setState(payload);
-        setOffline(false);
-      })
+      .then((payload) => { setState(payload); setOffline(false); })
       .catch(() => setOffline(true));
   }, []);
 
-  const decisionTone = useMemo(() => {
-    if (!decision) return "idle";
-    return decision.verdict.toLowerCase();
-  }, [decision]);
+  function showMessage(text: string) {
+    setMessage(text);
+    window.setTimeout(() => setMessage(""), 2600);
+  }
 
   async function seedMemory() {
-    setBusy(true);
-    setDecision(null);
+    setBusy("seed");
     try {
-      const payload = await callApi<AppState>("/api/demo/seed", { method: "POST" });
-      setState(payload);
+      setState(await callApi<AppState>("/api/demo/seed", { method: "POST" }));
       setOffline(false);
-    } catch {
+      setDecision(null);
+      showMessage("Example boundaries loaded into Sibyl Memory.");
+    } catch (error) {
       setOffline(true);
+      showMessage(error instanceof Error ? error.message : "Could not load examples.");
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
-  async function openFreshSession(event?: FormEvent) {
-    event?.preventDefault();
-    setBusy(true);
+  async function createRule(event: FormEvent) {
+    event.preventDefault();
+    setBusy("create");
+    const body: Record<string, string | number> = { kind: draft.kind, label: draft.label, detail: draft.detail };
+    if (draft.kind === "budget") body.max_budget = Number(draft.value);
+    if (draft.kind === "leverage") body.max_leverage = Number(draft.value);
+    if (draft.kind === "provider_condition") body.provider = draft.value;
+    if (draft.kind === "blocked_term") body.blocked_term = draft.value;
+
     try {
-      const result = await callApi<Decision>("/api/session/evaluate", {
-        method: "POST",
-        body: JSON.stringify({ request }),
-      });
-      setDecision(result);
-      setSession((value) => value + 1);
-      const nextState = await callApi<AppState>("/api/state");
-      setState(nextState);
+      setState(await callApi<AppState>("/api/mandates", { method: "POST", body: JSON.stringify(body) }));
+      setDraft(EMPTY_RULE);
+      setShowComposer(false);
+      setDecision(null);
       setOffline(false);
-    } catch {
-      setOffline(true);
+      showMessage("Boundary bound. It will apply to the next fresh session.");
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : "Could not bind this boundary.");
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  }
+
+  async function changeRuleStatus(rule: MemoryRule) {
+    const action = rule.status === "active" ? "revoke" : "restore";
+    setBusy(rule.name);
+    try {
+      setState(await callApi<AppState>(`/api/mandates/${encodeURIComponent(rule.name)}/${action}`, { method: "POST" }));
+      setDecision(null);
+      showMessage(action === "revoke" ? "Boundary revoked. It no longer affects decisions." : "Boundary restored and active again.");
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : "Could not update this boundary.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function evaluate(event: FormEvent) {
+    event.preventDefault();
+    setBusy("evaluate");
+    setMessage("");
+    try {
+      const result = await callApi<Decision>("/api/session/evaluate", { method: "POST", body: JSON.stringify({ request }) });
+      setDecision(result);
+      setState(await callApi<AppState>("/api/state"));
+      setOffline(false);
+    } catch (error) {
+      if (offline) setOffline(true);
+      showMessage(error instanceof Error ? error.message : "The session could not be evaluated.");
+    } finally {
+      setBusy(null);
     }
   }
 
   return (
-    <main>
+    <main className="app-frame">
       <nav className="topbar" aria-label="Primary navigation">
-        <a className="brand" href="#top" aria-label="Vowkeeper home">
-          <span className="brand-seal">V</span>
-          <span>Vowkeeper</span>
-        </a>
+        <a className="brand" href="#workspace" aria-label="Vowkeeper home"><span className="brand-seal">V</span><span>Vowkeeper</span></a>
         <div className="nav-meta">
-          <span className={offline ? "status offline" : "status"}><i /> {offline ? "API offline" : "Sibyl connected"}</span>
-          <a href="#proof">Proof path</a>
-          <a href="https://github.com/Sibyl-Labs/Sibyl-Memory" target="_blank" rel="noreferrer">Memory engine ↗</a>
+          <span className={offline ? "status offline" : "status"}><i />{offline ? "API offline" : "Sibyl connected"}</span>
+          <a href="#audit">Audit log</a>
+          <a href="https://github.com/zachsol/vowkeeper" target="_blank" rel="noreferrer">Source ↗</a>
         </div>
       </nav>
 
-      <section className="hero" id="top">
-        <div className="hero-copy">
-          <p className="eyebrow">Persistent mandate agent / session {String(session).padStart(2, "0")}</p>
-          <h1>Your agent forgot the conversation.<br /><em>It did not forget the boundary.</em></h1>
-          <p className="lede">Vowkeeper recalls the limits you signed, the providers who failed, and the permissions you revoked—then changes the next decision before money moves.</p>
-          <div className="hero-actions">
-            <button className="primary-action" onClick={state.seeded ? () => openFreshSession() : seedMemory} disabled={busy}>
-              {busy ? "Reading the record…" : state.seeded ? "Open a fresh session" : "Bind the demo mandate"}
-            </button>
-            <span>{state.seeded ? `${boundCount} durable memories ready` : "Writes three real Sibyl entities"}</span>
-          </div>
+      <header className="workspace-header" id="workspace">
+        <div>
+          <p className="eyebrow">Persistent authority console</p>
+          <h1>Give the agent a task.<br /><em>Keep your boundaries.</em></h1>
         </div>
-        <aside className="case-index" aria-label="Case file summary">
-          <span className="case-tab">CASE / VK-0826</span>
-          <dl>
-            <div><dt>Principal</dt><dd>Demo investor 01</dd></div>
-            <div><dt>Memory tier</dt><dd>WARM / entities</dd></div>
-            <div><dt>Decision log</dt><dd>COLD / journal</dd></div>
-            <div><dt>Storage</dt><dd>Local SQLite</dd></div>
-          </dl>
-          <div className="fingerprint" aria-hidden="true"><span /><span /><span /><span /></div>
-          <p>Memory contents stay on the agent's machine. No embeddings. No remote retrieval service.</p>
-        </aside>
-      </section>
+        <p>Define what the agent may never exceed. Vowkeeper recalls those rules in every fresh session and records the reason behind each decision.</p>
+        <dl className="system-readout">
+          <div><dt>Active</dt><dd>{state.active_count}</dd></div>
+          <div><dt>Revoked</dt><dd>{state.revoked_count}</dd></div>
+          <div><dt>Decisions</dt><dd>{state.events.length}</dd></div>
+        </dl>
+      </header>
 
-      <section className="decision-lab" id="proof">
-        <header className="section-heading">
-          <div><span>Fresh-session test</span><h2>Watch the answer change.</h2></div>
-          <p>The request below looks acceptable to a stateless agent. Vowkeeper retrieves the signed record before it answers.</p>
-        </header>
+      <section className="console-grid">
+        <aside className="vault-panel">
+          <header className="panel-heading">
+            <div><span>01 / Authority</span><h2>Mandate vault</h2></div>
+            <button className="icon-action" onClick={() => setShowComposer((value) => !value)} aria-expanded={showComposer}>{showComposer ? "Close" : "+ Add"}</button>
+          </header>
 
-        <div className="lab-grid">
-          <section className="memory-ledger">
-            <header><span>Remembered before this session</span><strong>{boundCount || "—"} active</strong></header>
-            <div className="thread" aria-hidden="true" />
-            {visibleRules.map((rule, index) => (
-              <article className={state.seeded ? "memory-card bound" : "memory-card preview"} key={rule.name} style={{ "--order": index } as React.CSSProperties}>
-                <span className="pin">{String(index + 1).padStart(2, "0")}</span>
-                <div><h3>{rule.label}</h3><p>{rule.detail}</p><small>{state.seeded ? rule.source : "Preview · not yet written"}</small></div>
+          {showComposer && (
+            <form className="rule-composer" onSubmit={createRule}>
+              <label>Boundary type<select value={draft.kind} onChange={(event) => setDraft({ ...draft, kind: event.target.value as RuleKind, value: "" })}>{Object.entries(KIND_META).map(([kind, meta]) => <option key={kind} value={kind}>{meta.label}</option>)}</select></label>
+              <label>Name<input required minLength={2} placeholder="e.g. Research budget" value={draft.label} onChange={(event) => setDraft({ ...draft, label: event.target.value })} /></label>
+              <label>{KIND_META[draft.kind].valueLabel}<input required type={draft.kind === "budget" || draft.kind === "leverage" ? "number" : "text"} min={draft.kind === "budget" || draft.kind === "leverage" ? "0.1" : undefined} step={draft.kind === "budget" ? "1" : "any"} placeholder={KIND_META[draft.kind].placeholder} value={draft.value} onChange={(event) => setDraft({ ...draft, value: event.target.value })} /></label>
+              <label>Instruction<textarea required minLength={4} rows={3} placeholder="Write the boundary in plain language." value={draft.detail} onChange={(event) => setDraft({ ...draft, detail: event.target.value })} /></label>
+              <button className="primary-action" disabled={busy === "create"}>{busy === "create" ? "Binding…" : "Bind boundary"}</button>
+            </form>
+          )}
+
+          {!activeRules.length && !showComposer && (
+            <div className="vault-empty"><span>∅</span><h3>No active boundaries</h3><p>Create one from scratch or load three examples to try the full flow.</p><button onClick={seedMemory} disabled={busy === "seed"}>{busy === "seed" ? "Loading…" : "Load examples"}</button></div>
+          )}
+
+          <div className="rule-stack">
+            {activeRules.map((rule, index) => (
+              <article className={`rule-card ${matchedNames.has(rule.name) ? "matched" : ""}`} key={rule.name}>
+                <span className="rule-index">{String(index + 1).padStart(2, "0")}</span>
+                <div><div className="rule-title"><h3>{rule.label}</h3><b>{ruleControl(rule)}</b></div><p>{rule.detail}</p><small>{rule.source}</small></div>
+                <button onClick={() => changeRuleStatus(rule)} disabled={busy === rule.name}>Revoke</button>
               </article>
             ))}
-          </section>
+          </div>
 
-          <form className="request-panel" onSubmit={openFreshSession}>
-            <header><span>Incoming request</span><strong>new context</strong></header>
-            <label htmlFor="request">What should the agent do?</label>
-            <textarea id="request" value={request} onChange={(event) => setRequest(event.target.value)} rows={5} />
-            <div className="counterfactual">
-              <span>Without recall</span>
-              <strong>APPROVE · $5,000 · 5×</strong>
-              <small>No prior boundary is present in the prompt.</small>
+          {!!revokedRules.length && <button className="revoked-toggle" onClick={() => setShowRevoked((value) => !value)}>{showRevoked ? "Hide" : "Show"} {revokedRules.length} revoked</button>}
+          {showRevoked && <div className="revoked-list">{revokedRules.map((rule) => <article key={rule.name}><div><strong>{rule.label}</strong><span>{ruleControl(rule)}</span></div><button onClick={() => changeRuleStatus(rule)} disabled={busy === rule.name}>Restore</button></article>)}</div>}
+        </aside>
+
+        <form className="session-panel" onSubmit={evaluate}>
+          <header className="panel-heading"><div><span>02 / New context</span><h2>Decision session</h2></div><b>fresh / isolated</b></header>
+          <label htmlFor="request">What should the agent do?</label>
+          <textarea id="request" rows={7} minLength={8} required value={request} onChange={(event) => { setRequest(event.target.value); setDecision(null); }} />
+          <div className="example-row" aria-label="Example requests">{EXAMPLES.map((example) => <button type="button" key={example.label} onClick={() => { setRequest(example.text); setDecision(null); }}>{example.label}</button>)}</div>
+          <div className="signal-readout"><div><span>Budget detected</span><strong>{requestSignals.budget}</strong></div><div><span>Leverage detected</span><strong>{requestSignals.leverage}</strong></div><div><span>Rules available</span><strong>{state.active_count}</strong></div></div>
+          <button className="evaluate-action" disabled={busy === "evaluate" || !state.active_count}>{busy === "evaluate" ? "Recalling memory…" : "Run memory check"}<span>↗</span></button>
+          {!state.active_count && <p className="inline-help">Bind at least one boundary before starting a session.</p>}
+        </form>
+
+        <section className={`result-panel ${decision?.verdict.toLowerCase() ?? "idle"}`} aria-live="polite">
+          <header className="panel-heading"><div><span>03 / Enforced answer</span><h2>Decision receipt</h2></div><b>{decision ? decision.session_id.slice(0, 8) : "waiting"}</b></header>
+          {decision ? (
+            <div className="decision-content">
+              <div className="verdict"><span>{decision.verdict}</span><b>{decision.verdict === "BLOCKED" ? "No authority released" : decision.allowed_budget ? `$${decision.allowed_budget.toLocaleString()} authority` : "No stated budget"}</b></div>
+              <h3>{decision.headline}</h3><p>{decision.explanation}</p>
+              <div className="memory-path"><span>Memory path</span>{decision.matches.length ? decision.matches.map((rule) => <div key={rule.name}><i /> <strong>{rule.label}</strong><small>{ruleControl(rule)}</small></div>) : <p>No boundary was triggered.</p>}</div>
+              <div className="counterfactual"><span>Without memory</span><p>{decision.counterfactual}</p></div>
             </div>
-            <button disabled={busy || !state.seeded}>{busy ? "Evaluating…" : "Evaluate in a fresh session"}</button>
-            {!state.seeded && <p className="form-note">Bind the demo mandate first. The decision button stays locked until Sibyl confirms the writes.</p>}
-          </form>
+          ) : (
+            <div className="receipt-empty"><div className="empty-seal"><i /><i /><i /></div><h3>No decision yet</h3><p>Run the request against your active mandate. The result and the exact memory path will appear here.</p></div>
+          )}
+        </section>
+      </section>
 
-          <section className={`decision-panel ${decisionTone}`} aria-live="polite">
-            <header><span>Decision after recall</span><strong>{decision?.session_id.slice(0, 8) ?? "waiting"}</strong></header>
-            {decision ? (
-              <>
-                <div className="verdict-mark"><span>{decision.verdict}</span><b>{decision.allowed_budget ? `$${decision.allowed_budget.toLocaleString()} max` : "no funds released"}</b></div>
-                <h3>{decision.headline}</h3>
-                <p>{decision.explanation}</p>
-                <div className="match-list">
-                  {decision.matches.map((match) => <span key={match.name}>↳ {match.label}</span>)}
-                </div>
-              </>
-            ) : (
-              <div className="empty-decision">
-                <span>∅</span>
-                <p>No decision yet. Start a fresh session to prove that durable memory changes the outcome.</p>
-              </div>
-            )}
-          </section>
+      <section className="audit-section" id="audit">
+        <header className="audit-heading"><div><p className="eyebrow">Append-only evidence</p><h2>Every answer leaves a receipt.</h2></div><p>Stored in Sibyl's COLD journal. Newest decision first.</p></header>
+        <div className="audit-table">
+          <div className="audit-header"><span>Time</span><span>Verdict</span><span>Request</span><span>Authority</span><span>Receipt</span></div>
+          {state.events.length ? state.events.map((entry) => <article key={entry.id}><time>{new Date(entry.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time><b className={entry.decision.toLowerCase()}>{entry.decision}</b><p>{entry.request || entry.summary.replace(/^\w+: /, "")}</p><span>{entry.allowed_budget ? `$${entry.allowed_budget.toLocaleString()}` : "—"}</span><code>{entry.id.slice(0, 10)}</code></article>) : <div className="audit-empty">No receipts yet. Run your first memory check above.</div>}
         </div>
       </section>
 
-      <section className="proof-strip">
-        <span>Eligibility proof</span>
-        <div><b>01</b><p>Persist a material boundary</p></div>
-        <i>→</i>
-        <div><b>02</b><p>Destroy transient context</p></div>
-        <i>→</i>
-        <div><b>03</b><p>Recall in a fresh session</p></div>
-        <i>→</i>
-        <div><b>04</b><p>Change the decision</p></div>
-      </section>
-
-      <section className="audit-section">
-        <header className="section-heading">
-          <div><span>Append-only evidence</span><h2>The reason survives the answer.</h2></div>
-          <p>Every evaluation records what was requested, which memories were applied, and what Vowkeeper allowed.</p>
-        </header>
-        <div className="audit-log">
-          {state.events.length ? state.events.map((entry) => (
-            <article key={entry.id}>
-              <time>{new Date(entry.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time>
-              <span className={`audit-verdict ${entry.decision.toLowerCase()}`}>{entry.decision}</span>
-              <p>{entry.summary}</p>
-              <code>{entry.id.slice(0, 12)}</code>
-            </article>
-          )) : <p className="audit-empty">The journal is empty. Complete the fresh-session test to create the first evidence entry.</p>}
-        </div>
-      </section>
-
-      <footer>
-        <div><strong>Vowkeeper</strong><span>Memory that holds the line.</span></div>
-        <p>Built for the Sibyl Labs Hackathon 2026 · Working prototype</p>
-      </footer>
+      {message && <div className="toast" role="status">{message}</div>}
+      <footer><div><strong>Vowkeeper</strong><span>Memory that holds the line.</span></div><p>{state.provider} · Built for Sibyl Labs Hackathon 2026</p></footer>
     </main>
   );
 }
