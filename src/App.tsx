@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import MemoryField from "./MemoryField";
 
 type RuleKind = "budget" | "leverage" | "provider_condition" | "blocked_term";
 
@@ -192,7 +193,9 @@ export default function App() {
   }
 
   return (
-    <main className="app-frame">
+    <main className={`app-frame mode-${decision?.verdict.toLowerCase() ?? "idle"}`}>
+      <MemoryField mode={decision?.verdict ?? "IDLE"} pulseKey={decision?.session_id} ruleCount={state.active_count} />
+      <div className="scanlines" aria-hidden="true" />
       <nav className="topbar" aria-label="Primary navigation">
         <a className="brand" href="#workspace" aria-label="Vowkeeper home"><span className="brand-seal">V</span><span>Vowkeeper</span></a>
         <div className="nav-meta">
@@ -213,6 +216,7 @@ export default function App() {
           <div><dt>Revoked</dt><dd>{state.revoked_count}</dd></div>
           <div><dt>Decisions</dt><dd>{state.events.length}</dd></div>
         </dl>
+        <div className="live-field-label" aria-hidden="true"><i /><span>Memory field / live</span><b>{String(state.active_count).padStart(2, "0")} nodes bound</b></div>
       </header>
 
       <section className="console-grid">

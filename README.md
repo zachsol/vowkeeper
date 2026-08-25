@@ -13,6 +13,8 @@ The working product loop is deliberately inspectable:
 
 The included examples demonstrate all three verdicts, but the interface and API accept user-created mandates and requests rather than relying on a fixed demo outcome.
 
+The interface includes a real-time canvas memory field: durable rules appear as flowing trajectories, and each verdict changes the field color and emits a decision shockwave. Reduced-motion preferences are respected.
+
 ## Stack
 
 - React, TypeScript and Vite
